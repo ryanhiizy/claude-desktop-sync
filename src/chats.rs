@@ -136,10 +136,12 @@ fn scan(members: &[PathBuf], chat_dirs: bool) -> Res<Snapshot> {
                 },
                 Kind::ChatDir(id) => put(&mut s.dirs, id, member, entry.path()),
                 Kind::Marker(id) if kind.is_file() => put(&mut s.markers, id, member, entry.path()),
-                Kind::Marker(id) => drop(s.blocked.insert(id.to_owned())),
+                Kind::Marker(id) => {
+                    s.blocked.insert(id.to_owned());
+                }
                 Kind::Other => match classify(name, !kind.is_dir(), chat_dirs) {
                     Kind::Chat(id) | Kind::ChatDir(id) | Kind::Marker(id) => {
-                        drop(s.blocked.insert(id.to_owned()))
+                        s.blocked.insert(id.to_owned());
                     }
                     Kind::Other => {}
                 },
