@@ -1,11 +1,9 @@
-//! Copies one account's sidebar sections to the others.
+//! Copies an account's sidebar sections to the signed-in account.
 //!
 //! Claude keeps every account's sections in one local store, keyed by `account/org`, and mirrors
-//! them in its preferences. Each account's definitions also live on Claude's server. Only the
-//! signed-in account can upload, by carrying a pending marker naming that exact `account/org`
-//! into its next launch; on an account switch the marker is cleared and the server copy wins.
-//! So a change reaches other accounts only when the app next starts signed in to each of them,
-//! which `sections_pending` tracks. The marker never names any other identity.
+//! them in its preferences. Each account's definitions also live on Claude's server, and on an
+//! account switch the server copy wins, so only the signed-in account can be changed. A pending
+//! marker naming its exact `account/org` makes the next launch upload the local copy.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -21,7 +19,6 @@ use serde_json::{Map, Value, json};
 use crate::{
     Paths, Res,
     accounts::{Account, Config},
-    chats::uuid_dirs,
     fsutil::{copy_tree, prepare_atomic, stamp, temp_sibling},
 };
 
@@ -243,24 +240,8 @@ impl Drop for Storage {
     }
 }
 
-struct Stage<'a> {
-    source: &'a Account,
-    targets: Vec<String>,
-    dry: bool,
-}
-
-struct Staged {
-    lines: Vec<String>,
-    owner: String,
-    wrote: bool,
-}
-
-/// The scope with the most chats, for an account that has several orgs; the signed-in org if it
-/// is the source, since that's the layout on screen.
-fn source_scope(groups: &Map<String, Value>, source: &str, signed_in: &str) -> Res<String> {
-    if signed_in.starts_with(source) && groups.contains_key(signed_in) {
-        return Ok(signed_in.to_owned());
-    }
+/// The scope with the most chats, for an account that has several orgs.
+fn source_scope(groups: &Map<String, Value>, source: &str) -> Option<String> {
     let prefix = format!("{source}/");
     let count = |v: &Value| v["assignments"].as_object().map_or(0, Map::len);
     let mut scopes: Vec<_> = groups
@@ -272,20 +253,28 @@ fn source_scope(groups: &Map<String, Value>, source: &str, signed_in: &str) -> R
         .iter()
         .rev()
         .max_by_key(|(_, v)| count(v))
-        .map(|(s, _)| (*s).clone())
-        .ok_or_else(|| "no saved sections".into())
+        .map(|(scope, _)| (*scope).clone())
 }
 
-fn apply(paths: &Paths, cfg: &Config, stage: &Stage) -> Res<Staged> {
-    let mut storage = Storage::open(paths, stage.dry)?;
+pub fn sync(paths: &Paths, cfg: &Config, source: &Account, dry: bool) -> Res<String> {
+    if !dry && claude_running(paths)? {
+        return Err("chats synced, sections not: quit Claude and run this again".into());
+    }
+    let mut storage = Storage::open(paths, dry)?;
     let db = &mut storage.db;
     let owner = read(db, "ccd-sync-owner")?
         .filter(|o| !o.is_empty())
         .ok_or("no signed-in account found")?;
+    if owner == source.id {
+        return Ok(format!(
+            "{} is signed in, so there's nothing to copy; switch to the account to update",
+            source.email
+        ));
+    }
     let org = read(db, "ccd-sync-org")?
         .filter(|o| !o.is_empty() && o != "mixed")
         .ok_or("signed-in org isn't settled")?;
-    let signed_in = format!("{owner}/{org}");
+    let dest = format!("{owner}/{org}");
     if db.get(&storage_key(PENDING)).is_some() {
         return Err(
             "Claude has sidebar edits waiting to upload; open it once to let them finish".into(),
@@ -296,75 +285,47 @@ fn apply(paths: &Paths, cfg: &Config, stage: &Stage) -> Res<Staged> {
     if store["version"] != 1 {
         return Err("unsupported sidebar store version".into());
     }
-    let state = store["state"].take();
-    let mut groups = state["customGroupsByScope"]
-        .as_object()
-        .ok_or("unrecognized sidebar store")?
-        .clone();
-    let mut layouts = state["codeSidebarByScope"]
-        .as_object()
-        .ok_or("unrecognized sidebar store")?
-        .clone();
-    store["state"] = state;
-
-    let source = &stage.source;
-    let src = source_scope(&groups, &source.id, &signed_in)
-        .map_err(|e| format!("{e} for {}; sign in to it once", source.email))?;
+    let groups = object_mut(&mut store["state"]["customGroupsByScope"], "sidebar store")?;
+    let src = source_scope(groups, &source.id)
+        .ok_or_else(|| format!("no saved sections for {}; sign in to it once", source.email))?;
     let source_groups = groups[&src].clone();
-    let source_layout = layouts
-        .get(&src)
-        .ok_or_else(|| format!("no section layout for {}", source.email))?
-        .clone();
     if source_groups["groups"].as_array().is_none_or(Vec::is_empty) {
         return Err(format!("{} has no sections to copy", source.email).into());
     }
+    let target_groups = groups.get(&dest).cloned().unwrap_or(json!({"groups": []}));
+    let layouts = object_mut(&mut store["state"]["codeSidebarByScope"], "sidebar store")?;
+    let source_layout = layouts
+        .get(&src)
+        .ok_or_else(|| format!("no section layout for {}", source.email))?;
 
-    let mut changed = Vec::new();
-    let mut lines = Vec::new();
-    let verb = if stage.dry { "would write" } else { "wrote" };
-    let empty = json!({"groups": []});
-    for account in &stage.targets {
-        for org in uuid_dirs(&paths.code_root().join(account))? {
-            let scope = format!("{account}/{org}");
-            if scope == src {
-                continue;
-            }
-            let dir = paths.code_root().join(account).join(&org);
-            let keep = |member: &str| {
-                member.strip_prefix(LOCAL_CHAT).is_some_and(|id| {
-                    let name = format!("local_{id}.json");
-                    !name.contains('/') && (stage.dry || dir.join(&name).exists())
-                })
-            };
-            let target = groups.get(&scope).unwrap_or(&empty);
-            let new = remap(&source_groups, target, &source_layout, &keep)
-                .map_err(|e| format!("{}: {e}", cfg.email_of(account)))?;
-            if groups.get(&scope) == Some(&new.groups) && layouts.get(&scope) == Some(&new.layout) {
-                continue;
-            }
-            let chats = new.groups["assignments"].as_object().map_or(0, Map::len);
-            let sections = new.groups["groups"].as_array().map_or(0, Vec::len);
-            let removed = match new.removed.as_slice() {
-                [] => String::new(),
-                names => format!(", replacing {}", names.join(", ")),
-            };
-            lines.push(format!(
-                "  {verb} {} ({}): {sections} sections, {chats} chats{removed}",
-                cfg.email_of(account),
-                &org[..8]
-            ));
-            groups.insert(scope.clone(), new.groups);
-            layouts.insert(scope.clone(), new.layout);
-            changed.push(scope);
-        }
+    let dir = paths.code_root().join(&owner).join(&org);
+    let keep = |member: &str| {
+        member.strip_prefix(LOCAL_CHAT).is_some_and(|id| {
+            let name = format!("local_{id}.json");
+            !name.contains('/') && (dry || dir.join(&name).exists())
+        })
+    };
+    let new = remap(&source_groups, &target_groups, source_layout, &keep)?;
+    let target = cfg.email_of(&owner);
+    if target_groups == new.groups && layouts.get(&dest) == Some(&new.layout) {
+        return Ok(format!("{target} already has {}'s sections", source.email));
     }
-    if changed.is_empty() {
-        return Ok(Staged {
-            lines,
-            owner,
-            wrote: false,
-        });
+    let chats = new.groups["assignments"].as_object().map_or(0, Map::len);
+    let sections = new.groups["groups"].as_array().map_or(0, Vec::len);
+    let replaced = match new.removed.as_slice() {
+        [] => String::new(),
+        names => format!(", replacing {}", names.join(", ")),
+    };
+    let summary = format!(
+        "{} -> {target}: {sections} sections, {chats} chats{replaced}",
+        source.email
+    );
+    if dry {
+        return Ok(format!("would copy sections {summary}"));
     }
+    layouts.insert(dest.clone(), new.layout.clone());
+    object_mut(&mut store["state"]["customGroupsByScope"], "sidebar store")?
+        .insert(dest.clone(), new.groups.clone());
 
     let config_path = paths.app().join("claude_desktop_config.json");
     let raw_config = fs::read(&config_path)?;
@@ -372,31 +333,17 @@ fn apply(paths: &Paths, cfg: &Config, stage: &Stage) -> Res<Staged> {
     let prefs = &mut config["preferences"]["epitaxyPrefs"];
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
     let mut updates: Vec<(String, Vec<u8>)> = Vec::new();
-    for (name, values) in MIRRORS.iter().zip([&groups, &layouts]) {
+    for (name, value) in MIRRORS.iter().zip([&new.groups, &new.layout]) {
         let wire = format!("LSS-persisted.{name}");
         let mut envelope = read_json(db, &wire)?;
-        for target in [&mut prefs[*name], &mut envelope["value"]] {
-            let target = object_mut(target, "section mirror")?;
-            for scope in &changed {
-                target.insert(scope.clone(), values[scope].clone());
-            }
+        for mirror in [&mut prefs[*name], &mut envelope["value"]] {
+            object_mut(mirror, "section mirror")?.insert(dest.clone(), value.clone());
         }
         envelope["timestamp"] = now.into();
         updates.push((wire, encode(&envelope.to_string())));
     }
-    store["state"]["customGroupsByScope"] = Value::Object(groups);
-    store["state"]["codeSidebarByScope"] = Value::Object(layouts);
     updates.push((STORE.to_owned(), encode(&store.to_string())));
-    if changed.contains(&signed_in) {
-        updates.push((PENDING.to_owned(), encode(&signed_in)));
-    }
-    if stage.dry {
-        return Ok(Staged {
-            lines,
-            owner,
-            wrote: false,
-        });
-    }
+    updates.push((PENDING.to_owned(), encode(&dest)));
 
     let backup = paths.backups().join(format!("sections-{}", stamp()));
     copy_tree(&leveldb_dir(paths), &backup.join("leveldb"))?;
@@ -432,111 +379,10 @@ fn apply(paths: &Paths, cfg: &Config, stage: &Stage) -> Res<Staged> {
         .into());
     }
     db.close()?;
-    lines.push(format!("  backup: {}", paths.brief(&backup)));
-    Ok(Staged {
-        lines,
-        owner,
-        wrote: true,
-    })
-}
-
-fn waiting_on(cfg: &Config) -> String {
-    let emails: Vec<_> = cfg
-        .sections_pending
-        .iter()
-        .map(|id| cfg.email_of(id))
-        .collect();
-    format!(
-        "Claude replaces an account's sections with its server copy when you switch to it, so {} still need a pass: switch, quit Claude, run `ccsync`.",
-        emails.join(", ")
-    )
-}
-
-/// `ccsync <account>`: copies `source`'s sections to every added account.
-pub fn sync(paths: &Paths, cfg: &mut Config, source: &Account, dry: bool) -> Res<String> {
-    if !dry && claude_running(paths)? {
-        return Err("chats synced, sections not: quit Claude and run this again".into());
-    }
-    let targets = cfg.accounts.iter().map(|a| a.id.clone()).collect();
-    let staged = apply(
-        paths,
-        cfg,
-        &Stage {
-            source,
-            targets,
-            dry,
-        },
-    )?;
-    let mut out = vec![format!("sections from {}:", source.email)];
-    out.extend(staged.lines);
-    if dry {
-        return Ok(out.join("\n"));
-    }
-    cfg.sections_from = Some(source.id.clone());
-    cfg.sections_pending = cfg
-        .accounts
-        .iter()
-        .map(|a| a.id.clone())
-        .filter(|id| *id != source.id && *id != staged.owner)
-        .collect();
-    cfg.save(paths)?;
-    if staged.wrote {
-        out.push("Reopen Claude to upload for the signed-in account.".to_owned());
-    }
-    if !cfg.sections_pending.is_empty() {
-        out.push(waiting_on(cfg));
-    }
-    Ok(out.join("\n"))
-}
-
-/// Plain `ccsync`: finishes an earlier `ccsync <account>` for whoever is signed in now, leaving
-/// accounts that already got it alone so later edits there survive.
-pub fn finish_pending(paths: &Paths, cfg: &mut Config, dry: bool) -> Res<Option<String>> {
-    if cfg.sections_pending.is_empty() {
-        return Ok(None);
-    }
-    let Some(source) = cfg
-        .sections_from
-        .clone()
-        .and_then(|id| cfg.accounts.iter().find(|a| a.id == id).cloned())
-    else {
-        return Ok(None);
-    };
-    if !dry && claude_running(paths)? {
-        return Ok(Some(format!(
-            "sections from {} still pending; quit Claude and run ccsync to apply them",
-            source.email
-        )));
-    }
-    let owner = {
-        let mut storage = Storage::open(paths, dry)?;
-        read(&mut storage.db, "ccd-sync-owner")?.unwrap_or_default()
-    };
-    if !cfg.sections_pending.contains(&owner) {
-        return Ok(Some(waiting_on(cfg)));
-    }
-    let staged = apply(
-        paths,
-        cfg,
-        &Stage {
-            source: &source,
-            targets: vec![owner.clone()],
-            dry,
-        },
-    )?;
-    let mut out = vec![format!("sections from {}:", source.email)];
-    out.extend(staged.lines);
-    if !dry {
-        cfg.sections_pending.retain(|id| *id != owner);
-        cfg.save(paths)?;
-        if staged.wrote {
-            out.push("Reopen Claude to upload for the signed-in account.".to_owned());
-        }
-        if !cfg.sections_pending.is_empty() {
-            out.push(waiting_on(cfg));
-        }
-    }
-    Ok(Some(out.join("\n")))
+    Ok(format!(
+        "copied sections {summary}\nreopen Claude to upload them; backup: {}",
+        paths.brief(&backup)
+    ))
 }
 
 #[cfg(test)]
@@ -667,15 +513,13 @@ mod tests {
     }
 
     #[test]
-    fn signed_in_destination_is_marked_for_upload() {
+    fn signed_in_account_is_marked_for_upload() {
         let paths = fixture("marked", B);
-        let mut cfg = config();
-        let src = account(&cfg, A);
+        let cfg = config();
 
-        let out = sync(&paths, &mut cfg, &src, false).unwrap();
+        let out = sync(&paths, &cfg, &account(&cfg, A), false).unwrap();
 
-        assert!(out.contains("Reopen Claude"), "{out}");
-        assert!(cfg.sections_pending.is_empty());
+        assert!(out.contains("reopen Claude"), "{out}");
         let mut db = reopen(&paths);
         let scope = format!("{B}/{ORG}");
         assert_eq!(read(&mut db, PENDING).unwrap().unwrap(), scope);
@@ -699,31 +543,14 @@ mod tests {
     }
 
     #[test]
-    fn source_signed_in_writes_others_and_leaves_them_pending() {
+    fn naming_the_signed_in_account_changes_nothing() {
         let paths = fixture("source-signed-in", A);
-        let mut cfg = config();
-        let src = account(&cfg, A);
-
-        let out = sync(&paths, &mut cfg, &src, false).unwrap();
-
-        assert!(out.contains("b@x.co"), "{out}");
-        assert_eq!(cfg.sections_pending, [B]);
-        assert!(reopen(&paths).get(&storage_key(PENDING)).is_none());
-        let saved = Config::load(&paths).unwrap();
-        assert_eq!(saved.sections_from.as_deref(), Some(A));
-    }
-
-    #[test]
-    fn dry_run_changes_nothing() {
-        let paths = fixture("dry", B);
-        let mut cfg = config();
-        let src = account(&cfg, A);
+        let cfg = config();
         let before = fs::read(paths.app().join("claude_desktop_config.json")).unwrap();
 
-        let out = sync(&paths, &mut cfg, &src, true).unwrap();
+        let out = sync(&paths, &cfg, &account(&cfg, A), false).unwrap();
 
-        assert!(out.contains("would write"), "{out}");
-        assert!(cfg.sections_from.is_none());
+        assert!(out.contains("nothing to copy"), "{out}");
         assert_eq!(
             fs::read(paths.app().join("claude_desktop_config.json")).unwrap(),
             before
@@ -732,21 +559,34 @@ mod tests {
     }
 
     #[test]
-    fn plain_run_finishes_only_the_signed_in_account() {
-        let paths = fixture("pending", B);
-        let mut cfg = config();
-        cfg.sections_from = Some(A.into());
-        cfg.sections_pending = vec![B.into()];
+    fn other_accounts_are_left_alone() {
+        let paths = fixture("others", B);
+        let cfg = config();
 
-        let out = finish_pending(&paths, &mut cfg, false).unwrap().unwrap();
+        sync(&paths, &cfg, &account(&cfg, A), false).unwrap();
 
-        assert!(out.contains("b@x.co"), "{out}");
-        assert!(cfg.sections_pending.is_empty());
+        let store = read_json(&mut reopen(&paths), STORE).unwrap();
+        let (groups, _) = source();
         assert_eq!(
-            read(&mut reopen(&paths), PENDING).unwrap().unwrap(),
-            format!("{B}/{ORG}")
+            store["state"]["customGroupsByScope"][format!("{A}/{ORG}")],
+            groups
         );
-        assert!(finish_pending(&paths, &mut cfg, false).unwrap().is_none());
+    }
+
+    #[test]
+    fn dry_run_changes_nothing() {
+        let paths = fixture("dry", B);
+        let cfg = config();
+        let before = fs::read(paths.app().join("claude_desktop_config.json")).unwrap();
+
+        let out = sync(&paths, &cfg, &account(&cfg, A), true).unwrap();
+
+        assert!(out.contains("would copy"), "{out}");
+        assert_eq!(
+            fs::read(paths.app().join("claude_desktop_config.json")).unwrap(),
+            before
+        );
+        assert!(reopen(&paths).get(&storage_key(PENDING)).is_none());
     }
 
     #[test]
@@ -758,8 +598,7 @@ mod tests {
             db.flush().unwrap();
             db.close().unwrap();
         }
-        let mut cfg = config();
-        let src = account(&cfg, A);
-        assert!(sync(&paths, &mut cfg, &src, false).is_err());
+        let cfg = config();
+        assert!(sync(&paths, &cfg, &account(&cfg, A), false).is_err());
     }
 }

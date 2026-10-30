@@ -13,7 +13,7 @@ const USAGE: &str = "\
 Sync Claude desktop chats and sidebar sections across accounts.
 
   ccsync                   sync chats across added accounts
-  ccsync <account>         also copy <account>'s sections to every added account
+  ccsync <account>         also copy <account>'s sections to the signed-in account
   ccsync list              show accounts on this Mac
   ccsync add <email> [id]  add an account
   ccsync remove <account>  stop syncing an account
@@ -83,13 +83,8 @@ fn sync(paths: &Paths, source: Option<&str>, dry: bool) -> Res {
     // A typo should fail before anything is touched.
     let source = source.map(|q| cfg.resolve(q).cloned()).transpose()?;
     let chats_ok = chats::sync(paths, &mut cfg, dry)?;
-    match source {
-        Some(source) => println!("{}", sections::sync(paths, &mut cfg, &source, dry)?),
-        None => {
-            if let Some(status) = sections::finish_pending(paths, &mut cfg, dry)? {
-                println!("{status}");
-            }
-        }
+    if let Some(source) = source {
+        println!("{}", sections::sync(paths, &cfg, &source, dry)?);
     }
     if chats_ok {
         Ok(())

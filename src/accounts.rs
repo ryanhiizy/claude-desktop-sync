@@ -27,9 +27,6 @@ pub struct Config {
     pub accounts: Vec<Account>,
     /// Accounts covered by a backup of the chat folders.
     pub backed_up: Vec<String>,
-    /// The account whose sections were last chosen, and who still hasn't received them.
-    pub sections_from: Option<String>,
-    pub sections_pending: Vec<String>,
 }
 
 fn strings(v: &Value) -> Vec<String> {
@@ -70,8 +67,6 @@ impl Config {
         Ok(Self {
             accounts,
             backed_up: strings(&v["backedUp"]),
-            sections_from: v["sectionsFrom"].as_str().map(str::to_owned),
-            sections_pending: strings(&v["sectionsPending"]),
         })
     }
 
@@ -84,8 +79,6 @@ impl Config {
         let body = json!({
             "accounts": accounts,
             "backedUp": self.backed_up,
-            "sectionsFrom": self.sections_from,
-            "sectionsPending": self.sections_pending,
         });
         write_atomic(
             &Self::path(paths),
@@ -258,11 +251,6 @@ pub fn remove(paths: &Paths, query: &str) -> Res {
     let account = cfg.resolve(query)?.clone();
     cfg.accounts.retain(|a| a.id != account.id);
     cfg.backed_up.retain(|id| *id != account.id);
-    cfg.sections_pending.retain(|id| *id != account.id);
-    if cfg.sections_from.as_deref() == Some(&account.id) {
-        cfg.sections_from = None;
-        cfg.sections_pending.clear();
-    }
     cfg.save(paths)?;
     println!("removed {}; chats already copied stay put", account.email);
     Ok(())

@@ -489,7 +489,6 @@ pub mod tests {
         Config {
             accounts: vec![account("a@x.co", A), account("b@x.co", B)],
             backed_up: vec![A.into(), B.into()],
-            ..Config::default()
         }
     }
 

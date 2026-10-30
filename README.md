@@ -1,4 +1,4 @@
-# claude-sync
+# claude-desktop-sync
 
 `ccsync` keeps Claude desktop chats and sidebar sections matched across accounts on a Mac. It only runs when you run it. A slim Rust rework of [ccdejavu](https://github.com/wjames111/ccdejavu), which has a background watcher this doesn't.
 
@@ -14,7 +14,7 @@ ccsync add you@work.com      # or: ccsync add you@work.com 3f1a9c2e
 ccsync remove you@work.com
 
 ccsync                       # sync chats
-ccsync you@work.com          # sync chats, then copy that account's sections to every added account
+ccsync you@work.com          # sync chats, then copy that account's sections to the signed-in account
 ccsync -n work               # dry run; any unique part of an email works
 ```
 
@@ -28,12 +28,11 @@ An account's first sync backs up both chat folders to `~/.ccsync/backups/`. If a
 
 ## Sections
 
-The account you name wins: same-named sections keep each account's section ID, missing ones are created, and extra ones are replaced. Chats an account doesn't have are left out. Section sync needs Claude fully quit, and backs up the storage it changes first.
+`ccsync <account>` copies that account's sections to whichever account Claude is signed in to. You only name the source. Same-named sections keep the signed-in account's section ID, missing ones are created, and extra ones are replaced. Chats the account doesn't have are left out.
 
-Claude stores each account's section definitions on its server, and only uploads for the account signed in when the app starts. Switching accounts replaces the local copy with that account's server copy. So one command can't finish every account at once:
+Quit Claude, run it, reopen Claude, and the signed-in account uploads the result. The storage it changes is backed up first.
 
-1. Quit Claude and run `ccsync you@work.com`. Every account is written locally, and the signed-in one uploads when you reopen Claude.
-2. For each other account the first time you use it: switch to it, quit Claude, run `ccsync`. Pending accounts are remembered, and each is finished once, so later edits there survive.
+Claude stores each account's sections on its server, and only uploads for the account it starts signed in to. To update another account, switch to it in Claude and repeat.
 
 This relies on undocumented Claude internals, and an app update could break it. To restore, quit Claude and copy the files from `~/.ccsync/backups/sections-*` back.
 

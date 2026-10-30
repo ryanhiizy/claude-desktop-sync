@@ -1,10 +1,10 @@
 [package]
-name = "claude-sync"
+name = "claude-desktop-sync"
 version = "0.1.0"
 edition = "2024"
 description = "Manually sync Claude desktop chats and sidebar sections across accounts on a Mac"
 license = "MIT"
-repository = "https://github.com/ryanhiizy/claude-sync"
+repository = "https://github.com/ryanhiizy/claude-desktop-sync"
 
 [[bin]]
 name = "ccsync"
