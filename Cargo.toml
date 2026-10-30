@@ -1,0 +1,23 @@
+[package]
+name = "claude-sync"
+version = "0.1.0"
+edition = "2024"
+description = "Manually sync Claude desktop chats and sidebar sections across accounts on a Mac"
+license = "MIT"
+repository = "https://github.com/ryanhiizy/claude-sync"
+
+[[bin]]
+name = "ccsync"
+path = "src/main.rs"
+
+[dependencies]
+rusty-leveldb = "4.0.2"
+serde = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
+
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
