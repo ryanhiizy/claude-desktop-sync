@@ -3,7 +3,13 @@ mod chats;
 mod fsutil;
 mod sections;
 
-use std::{env, error::Error, fs::File, path::PathBuf, process::ExitCode};
+use std::{
+    env,
+    error::Error,
+    fs::File,
+    path::PathBuf,
+    process::{Command, ExitCode},
+};
 
 use accounts::Config;
 
@@ -20,7 +26,7 @@ Sync Claude desktop chats and sidebar sections across accounts.
 
   -n, --dry-run            show what would change, change nothing
 
-<account> is an email or any unique part of one. Section sync needs Claude quit.";
+<account> is an email or any unique part of one. Syncing needs Claude quit; a dry run doesn't.";
 
 pub struct Paths {
     home: PathBuf,
@@ -74,7 +80,32 @@ fn lock(paths: &Paths) -> Res<File> {
     Ok(file)
 }
 
+fn claude_running(paths: &Paths) -> Res<bool> {
+    if paths.sandboxed {
+        return Ok(false);
+    }
+    let status = Command::new("/usr/bin/pgrep")
+        .args(["-x", "Claude"])
+        .output()?
+        .status;
+    match status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err("can't tell whether Claude is running".into()),
+    }
+}
+
+/// Claude keeps chats in memory and saves over the files, so a change made while it runs is lost
+/// and its stale copy then looks newest.
+fn require_quit(dry: bool, running: impl FnOnce() -> Res<bool>) -> Res {
+    if !dry && running()? {
+        return Err("quit Claude and run this again".into());
+    }
+    Ok(())
+}
+
 fn sync(paths: &Paths, source: Option<&str>, dry: bool) -> Res {
+    require_quit(dry, || claude_running(paths))?;
     let _lock = if dry { None } else { Some(lock(paths)?) };
     let mut cfg = Config::load(paths)?;
     if cfg.accounts.len() < 2 {
@@ -89,7 +120,7 @@ fn sync(paths: &Paths, source: Option<&str>, dry: bool) -> Res {
     if chats_ok {
         Ok(())
     } else {
-        Err("some chat folders were skipped".into())
+        Err("some chats or chat folders were skipped".into())
     }
 }
 
@@ -124,5 +155,17 @@ fn main() -> ExitCode {
             eprintln!("ccsync: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn syncing_needs_claude_quit() {
+        assert!(require_quit(false, || Ok(true)).is_err());
+        assert!(require_quit(false, || Ok(false)).is_ok());
+        assert!(require_quit(true, || panic!("a dry run needn't check")).is_ok());
     }
 }

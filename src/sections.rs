@@ -9,7 +9,6 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     path::PathBuf,
-    process::Command,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -188,21 +187,6 @@ fn remap(
     })
 }
 
-fn claude_running(paths: &Paths) -> Res<bool> {
-    if paths.sandboxed {
-        return Ok(false);
-    }
-    let status = Command::new("/usr/bin/pgrep")
-        .args(["-x", "Claude"])
-        .output()?
-        .status;
-    match status.code() {
-        Some(0) => Ok(true),
-        Some(1) => Ok(false),
-        _ => Err("can't tell whether Claude is running".into()),
-    }
-}
-
 fn leveldb_dir(paths: &Paths) -> PathBuf {
     paths.app().join("Local Storage/leveldb")
 }
@@ -257,9 +241,6 @@ fn source_scope(groups: &Map<String, Value>, source: &str) -> Option<String> {
 }
 
 pub fn sync(paths: &Paths, cfg: &Config, source: &Account, dry: bool) -> Res<String> {
-    if !dry && claude_running(paths)? {
-        return Err("chats synced, sections not: quit Claude and run this again".into());
-    }
     let mut storage = Storage::open(paths, dry)?;
     let db = &mut storage.db;
     let owner = read(db, "ccd-sync-owner")?
