@@ -1,11 +1,14 @@
 //! Keeps chat files matched across every org folder of every added account.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt, fs,
     io::ErrorKind,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicUsize, Ordering::Relaxed},
+    sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering::Relaxed},
+    },
     time::SystemTime,
 };
 
@@ -151,20 +154,30 @@ fn scan(members: &[PathBuf], chat_dirs: bool) -> Res<Snapshot> {
     Ok(s)
 }
 
-struct SessionId;
+#[derive(Default)]
+struct ChatFields {
+    session_id: Option<String>,
+    transcript: Option<String>,
+    title: Option<String>,
+}
 
-impl<'de> Visitor<'de> for SessionId {
-    type Value = Option<String>;
+struct ChatVisitor;
+
+impl<'de> Visitor<'de> for ChatVisitor {
+    type Value = ChatFields;
     fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.write_str("a chat object")
     }
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-        let mut found = None;
+        let mut found = ChatFields::default();
         while let Some(key) = map.next_key::<String>()? {
-            if key == "sessionId" {
-                found = Some(map.next_value()?);
-            } else {
-                map.next_value::<IgnoredAny>()?;
+            match key.as_str() {
+                "sessionId" => found.session_id = map.next_value()?,
+                "cliSessionId" => found.transcript = map.next_value()?,
+                "title" => found.title = map.next_value()?,
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
             }
         }
         Ok(found)
@@ -173,17 +186,55 @@ impl<'de> Visitor<'de> for SessionId {
 
 /// Stops an app update that changes the format from spreading: every chat must parse and name
 /// itself. Skips values without allocating them, since these files total a gigabyte.
-fn check_chat(path: &Path, id: &str) -> Res {
+fn check_chat(path: &Path, id: &str) -> Res<ChatFields> {
     let raw = fs::read(path)?;
     let mut de = serde_json::Deserializer::from_slice(&raw);
     let found = de
-        .deserialize_map(SessionId)
+        .deserialize_map(ChatVisitor)
         .and_then(|found| de.end().map(|()| found));
     let found = found.map_err(|e| format!("{}: not a chat file: {e}", path.display()))?;
-    if found.as_deref().and_then(|s| s.strip_prefix("local_")) != Some(id) {
-        return Err(format!("{}: unexpected sessionId {found:?}", path.display()).into());
+    let session_id = found.session_id.as_deref();
+    if session_id.and_then(|s| s.strip_prefix("local_")) != Some(id) {
+        return Err(format!("{}: unexpected sessionId {session_id:?}", path.display()).into());
     }
-    Ok(())
+    Ok(found)
+}
+
+/// Copies of a chat that open different transcripts, by chat id then transcript.
+type Conflicts<'a> = BTreeMap<&'a str, (Option<String>, BTreeMap<String, Vec<&'a Path>>)>;
+
+/// Modified time can't choose between these: Claude stamps a stale copy as new when it saves one,
+/// so the newest copy may be the wrong one.
+fn find_conflicts<'a>(checked: Vec<(&'a str, &'a Path, ChatFields)>) -> Conflicts<'a> {
+    let mut conflicts = Conflicts::new();
+    for (id, path, fields) in checked {
+        let (title, copies) = conflicts.entry(id).or_default();
+        if fields.title.is_some() {
+            *title = fields.title;
+        }
+        if let Some(transcript) = fields.transcript {
+            copies.entry(transcript).or_default().push(path);
+        }
+    }
+    conflicts.retain(|_, (_, copies)| copies.len() > 1);
+    conflicts
+}
+
+fn report_conflict(
+    id: &str,
+    title: Option<&str>,
+    copies: &BTreeMap<String, Vec<&Path>>,
+    paths: &Paths,
+) {
+    let title = title.unwrap_or("untitled");
+    println!("skipped \"{title}\" (local_{id}): its copies open different transcripts");
+    for (transcript, files) in copies {
+        println!("  {transcript}");
+        for file in files {
+            println!("    {}", paths.brief(file));
+        }
+    }
+    println!("  delete the copies of the wrong transcript, then sync again");
 }
 
 fn newest_wins(
@@ -376,24 +427,40 @@ fn sync_root(
     chat_dirs: bool,
     paths: &Paths,
     dry: bool,
-) -> Res<usize> {
-    let s = scan(members, chat_dirs)?;
+) -> Res<(usize, usize)> {
+    let mut s = scan(members, chat_dirs)?;
     let chats: Vec<(&String, &PathBuf)> = s
         .chats
         .iter()
         .flat_map(|(id, have)| have.values().map(move |(path, _)| (id, path)))
         .collect();
-    par(&chats, |(id, path)| check_chat(path, id))?;
+    let checked = Mutex::new(Vec::with_capacity(chats.len()));
+    par(&chats, |(id, path)| {
+        let fields = check_chat(path, id)?;
+        checked
+            .lock()
+            .unwrap()
+            .push((id.as_str(), path.as_path(), fields));
+        Ok(())
+    })?;
+    let mut conflicts = find_conflicts(checked.into_inner().unwrap());
+    conflicts.retain(|id, _| !s.markers.contains_key(*id));
+    let skipped = conflicts.len();
+    for (id, (title, copies)) in &conflicts {
+        report_conflict(id, title.as_deref(), copies, paths);
+    }
+    let conflicted: Vec<String> = conflicts.keys().map(|id| (*id).to_owned()).collect();
+    s.blocked.extend(conflicted);
     let actions = plan(members, root, trash, &s)?;
     if dry {
         let mut lines: Vec<_> = actions.iter().map(|a| a.describe(paths)).collect();
         lines.sort_unstable();
         lines.iter().for_each(|line| println!("{line}"));
-        return Ok(actions.len());
+        return Ok((actions.len(), skipped));
     }
     let (done, result) = apply(&actions);
     result.map_err(|e| format!("stopped after {done} of {} changes: {e}", actions.len()))?;
-    Ok(done)
+    Ok((done, skipped))
 }
 
 fn member_folders(root: &Path, cfg: &Config) -> Res<Vec<PathBuf>> {
@@ -441,7 +508,8 @@ pub fn sync(paths: &Paths, cfg: &mut Config, dry: bool) -> Res<bool> {
             continue;
         }
         match sync_root(&members, root, &trash, *chat_dirs, paths, dry) {
-            Ok(n) => {
+            Ok((n, skipped)) => {
+                ok &= skipped == 0;
                 let verb = if dry { "planned" } else { "made" };
                 println!(
                     "{name}: {n} changes {verb} across {} folders",
@@ -560,6 +628,81 @@ pub mod tests {
                 .modified()
                 .unwrap()
         );
+    }
+
+    fn chat_on(dir: &Path, id: &str, transcript: Option<&str>, age: u64) {
+        let path = dir.join(format!("local_{id}.json"));
+        let transcript = transcript.map_or(String::new(), |t| format!(r#","cliSessionId":"{t}""#));
+        fs::write(
+            &path,
+            format!(r#"{{"sessionId":"local_{id}","title":"Work"{transcript}}}"#),
+        )
+        .unwrap();
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(age))
+            .unwrap();
+    }
+
+    fn transcript_of(dir: &Path, id: &str) -> serde_json::Value {
+        let raw = fs::read(dir.join(format!("local_{id}.json"))).unwrap();
+        serde_json::from_slice::<serde_json::Value>(&raw).unwrap()["cliSessionId"].clone()
+    }
+
+    #[test]
+    fn copies_opening_different_transcripts_are_left_alone() {
+        let paths = sandbox("conflict");
+        let (a, b) = (folder(&paths, A), folder(&paths, B));
+        chat_on(&a, CHAT, Some("right"), 100);
+        chat_on(&b, CHAT, Some("stale"), 10);
+        let other = "eeeeeeee-0000-4000-8000-000000000005";
+        chat(&a, other, "only-a", 50);
+
+        assert!(!sync(&paths, &mut config(), false).unwrap());
+
+        assert_eq!(transcript_of(&a, CHAT), "right");
+        assert_eq!(transcript_of(&b, CHAT), "stale");
+        assert!(b.join(format!("local_{other}.json")).exists());
+    }
+
+    #[test]
+    fn deleting_the_wrong_copy_resolves_a_conflict() {
+        let paths = sandbox("resolve");
+        let (a, b) = (folder(&paths, A), folder(&paths, B));
+        chat_on(&a, CHAT, Some("right"), 100);
+        chat_on(&b, CHAT, Some("stale"), 10);
+        assert!(!sync(&paths, &mut config(), false).unwrap());
+
+        fs::remove_file(b.join(format!("local_{CHAT}.json"))).unwrap();
+
+        assert!(sync(&paths, &mut config(), false).unwrap());
+        assert_eq!(transcript_of(&b, CHAT), "right");
+    }
+
+    #[test]
+    fn a_copy_without_a_transcript_is_no_conflict() {
+        let paths = sandbox("no-transcript");
+        let (a, b) = (folder(&paths, A), folder(&paths, B));
+        chat_on(&a, CHAT, None, 100);
+        chat_on(&b, CHAT, Some("started"), 10);
+
+        assert!(sync(&paths, &mut config(), false).unwrap());
+        assert_eq!(transcript_of(&a, CHAT), "started");
+    }
+
+    #[test]
+    fn a_delete_still_wins_over_a_conflict() {
+        let paths = sandbox("conflict-delete");
+        let (a, b) = (folder(&paths, A), folder(&paths, B));
+        chat_on(&a, CHAT, Some("one"), 100);
+        chat_on(&b, CHAT, Some("two"), 10);
+        fs::write(a.join(format!("deleted_{CHAT}")), "").unwrap();
+
+        assert!(sync(&paths, &mut config(), false).unwrap());
+        assert!(!a.join(format!("local_{CHAT}.json")).exists());
+        assert!(!b.join(format!("local_{CHAT}.json")).exists());
     }
 
     #[test]
