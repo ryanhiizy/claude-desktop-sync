@@ -161,6 +161,13 @@ struct ChatFields {
     transcript: Option<String>,
     title: Option<String>,
     last_assistant: Option<String>,
+    remote_history: RemoteHistory,
+}
+
+#[derive(Default)]
+struct RemoteHistory {
+    prior: Vec<String>,
+    last_activity: Option<u64>,
 }
 
 struct ChatVisitor;
@@ -182,6 +189,22 @@ impl<'de> Visitor<'de> for ChatVisitor {
                         .next_value::<serde_json::Value>()?
                         .as_str()
                         .map(str::to_owned);
+                }
+                "priorRemoteCliSessionIds" => {
+                    if let serde_json::Value::Array(ids) = map.next_value()? {
+                        let prior: Option<Vec<_>> = ids
+                            .iter()
+                            .map(|id| id.as_str().filter(|id| is_uuid(id)))
+                            .collect();
+                        if let Some(prior) = prior {
+                            found.remote_history.prior =
+                                prior.into_iter().map(str::to_owned).collect();
+                        }
+                    }
+                }
+                "lastActivityAt" => {
+                    found.remote_history.last_activity =
+                        map.next_value::<serde_json::Value>()?.as_u64();
                 }
                 _ => {
                     map.next_value::<IgnoredAny>()?;
@@ -211,8 +234,35 @@ fn check_chat(path: &Path, id: &str) -> Res<ChatFields> {
 #[derive(Default)]
 struct Conflict<'a> {
     title: Option<String>,
-    copies: BTreeMap<String, Vec<&'a Path>>,
+    copies: BTreeMap<String, TranscriptCopies<'a>>,
     saved_tips: Vec<String>,
+}
+
+#[derive(Default)]
+struct TranscriptCopies<'a> {
+    paths: Vec<&'a Path>,
+    remote_histories: Vec<RemoteHistory>,
+}
+
+impl Conflict<'_> {
+    fn recorded_continuation(&self) -> Option<&str> {
+        self.copies.iter().find_map(|(id, copies)| {
+            let competing = self.copies.iter().filter(|(other, _)| *other != id);
+            let proven = copies.remote_histories.iter().all(|candidate| {
+                if candidate.prior.contains(id) {
+                    return false;
+                }
+                competing.clone().all(|(other, copies)| {
+                    candidate.prior.contains(other)
+                        && copies.remote_histories.iter().all(|prior| {
+                            matches!((prior.last_activity, candidate.last_activity), (Some(before), Some(after)) if before < after)
+                                && !prior.prior.contains(id)
+                        })
+                })
+            });
+            proven.then_some(id.as_str())
+        })
+    }
 }
 
 /// Modified time can't choose between these: Claude stamps a stale copy as new when it saves one,
@@ -227,7 +277,9 @@ fn find_conflicts<'a>(
             conflict.title = fields.title;
         }
         if let Some(transcript) = fields.transcript {
-            conflict.copies.entry(transcript).or_default().push(path);
+            let copies = conflict.copies.entry(transcript).or_default();
+            copies.paths.push(path);
+            copies.remote_histories.push(fields.remote_history);
         }
         conflict.saved_tips.extend(fields.last_assistant);
     }
@@ -238,15 +290,15 @@ fn find_conflicts<'a>(
 fn report_conflict(
     id: &str,
     title: Option<&str>,
-    copies: &BTreeMap<String, Vec<&Path>>,
+    copies: &BTreeMap<String, TranscriptCopies<'_>>,
     paths: &Paths,
     chat_dirs: bool,
 ) {
     let title = title.unwrap_or("untitled");
     println!("skipped \"{title}\" (local_{id}): its copies open different transcripts");
-    for (transcript, files) in copies {
+    for (transcript, copies) in copies {
         println!("  {transcript}");
-        for file in files {
+        for file in &copies.paths {
             println!("    {}", paths.brief(file));
         }
     }
@@ -469,11 +521,13 @@ fn sync_root(
         }
         let title = conflict.title.as_deref();
         if !s.blocked.contains(id)
-            && let Some(transcript) = transcripts::continuation(
-                &paths.home,
-                conflict.copies.keys().map(String::as_str),
-                &conflict.saved_tips,
-            )
+            && let Some(transcript) = conflict.recorded_continuation().or_else(|| {
+                transcripts::continuation(
+                    &paths.home,
+                    conflict.copies.keys().map(String::as_str),
+                    &conflict.saved_tips,
+                )
+            })
         {
             let verb = if dry { "would resolve" } else { "resolving" };
             println!(
@@ -485,7 +539,7 @@ fn sync_root(
                 root,
                 members,
                 &s.chats[id],
-                &conflict.copies[transcript],
+                &conflict.copies[transcript].paths,
                 dry,
             )?;
             resolved_ids.push(id.to_owned());
@@ -800,6 +854,37 @@ pub mod tests {
         fs::create_dir_all(&dir).unwrap();
         let lines: Vec<_> = records.iter().map(ToString::to_string).collect();
         fs::write(dir.join(format!("{id}.jsonl")), lines.join("\n")).unwrap();
+    }
+
+    #[test]
+    fn sync_uses_recorded_remote_lineage_only_if_competing_activity_is_older() {
+        use serde_json::json;
+
+        let paths = sandbox("remote-lineage");
+        let (a, b) = (folder(&paths, A), folder(&paths, B));
+        let file = |dir: &Path| dir.join(format!("local_{CHAT}.json"));
+        let write = |dir: &Path, id, activity, prior: &[&str]| {
+            let body = json!({
+                "sessionId": format!("local_{CHAT}"),
+                "cliSessionId": id,
+                "lastActivityAt": activity,
+                "priorRemoteCliSessionIds": prior
+            });
+            fs::write(file(dir), body.to_string()).unwrap();
+        };
+        write(&b, B, 20, &[A]);
+        write(&a, A, 30, &[]);
+        assert!(!sync(&paths, &mut config(), false).unwrap());
+        assert_eq!(transcript_of(&a, CHAT), A);
+
+        write(&a, A, 10, &[B]);
+        assert!(!sync(&paths, &mut config(), false).unwrap());
+        assert_eq!(transcript_of(&a, CHAT), A);
+        assert!(!paths.backups().exists());
+
+        write(&a, A, 10, &[]);
+        assert!(sync(&paths, &mut config(), false).unwrap());
+        assert_eq!(transcript_of(&a, CHAT), B);
     }
 
     #[test]
