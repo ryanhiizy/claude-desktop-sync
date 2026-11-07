@@ -17,7 +17,8 @@ use serde::de::{Deserializer, IgnoredAny, MapAccess, Visitor};
 use crate::{
     Paths, Res,
     accounts::Config,
-    fsutil::{copy_chat_file, copy_tree, par, stamp},
+    fsutil::{copy_chat_file, copy_tree, par, replace_chat_file, stamp},
+    transcripts,
 };
 
 /// Paths in a Cowork chat folder that belong to the signed-in account, not the chat.
@@ -159,6 +160,7 @@ struct ChatFields {
     session_id: Option<String>,
     transcript: Option<String>,
     title: Option<String>,
+    last_assistant: Option<String>,
 }
 
 struct ChatVisitor;
@@ -175,6 +177,12 @@ impl<'de> Visitor<'de> for ChatVisitor {
                 "sessionId" => found.session_id = map.next_value()?,
                 "cliSessionId" => found.transcript = map.next_value()?,
                 "title" => found.title = map.next_value()?,
+                "lastAssistantUuid" => {
+                    found.last_assistant = map
+                        .next_value::<serde_json::Value>()?
+                        .as_str()
+                        .map(str::to_owned);
+                }
                 _ => {
                     map.next_value::<IgnoredAny>()?;
                 }
@@ -200,23 +208,30 @@ fn check_chat(path: &Path, id: &str) -> Res<ChatFields> {
     Ok(found)
 }
 
-/// Copies of a chat that open different transcripts, by chat id then transcript.
-type Conflicts<'a> = BTreeMap<&'a str, (Option<String>, BTreeMap<String, Vec<&'a Path>>)>;
+#[derive(Default)]
+struct Conflict<'a> {
+    title: Option<String>,
+    copies: BTreeMap<String, Vec<&'a Path>>,
+    saved_tips: Vec<String>,
+}
 
 /// Modified time can't choose between these: Claude stamps a stale copy as new when it saves one,
 /// so the newest copy may be the wrong one.
-fn find_conflicts<'a>(checked: Vec<(&'a str, &'a Path, ChatFields)>) -> Conflicts<'a> {
-    let mut conflicts = Conflicts::new();
+fn find_conflicts<'a>(
+    checked: Vec<(&'a str, &'a Path, ChatFields)>,
+) -> BTreeMap<&'a str, Conflict<'a>> {
+    let mut conflicts: BTreeMap<_, Conflict<'_>> = BTreeMap::new();
     for (id, path, fields) in checked {
-        let (title, copies) = conflicts.entry(id).or_default();
+        let conflict = conflicts.entry(id).or_default();
         if fields.title.is_some() {
-            *title = fields.title;
+            conflict.title = fields.title;
         }
         if let Some(transcript) = fields.transcript {
-            copies.entry(transcript).or_default().push(path);
+            conflict.copies.entry(transcript).or_default().push(path);
         }
+        conflict.saved_tips.extend(fields.last_assistant);
     }
-    conflicts.retain(|_, (_, copies)| copies.len() > 1);
+    conflicts.retain(|_, conflict| conflict.copies.len() > 1);
     conflicts
 }
 
@@ -225,6 +240,7 @@ fn report_conflict(
     title: Option<&str>,
     copies: &BTreeMap<String, Vec<&Path>>,
     paths: &Paths,
+    chat_dirs: bool,
 ) {
     let title = title.unwrap_or("untitled");
     println!("skipped \"{title}\" (local_{id}): its copies open different transcripts");
@@ -234,7 +250,8 @@ fn report_conflict(
             println!("    {}", paths.brief(file));
         }
     }
-    println!("  delete the copies of the wrong transcript, then sync again");
+    let root = if chat_dirs { "cowork" } else { "code" };
+    println!("  choose a transcript: ccsync resolve {root} local_{id} <transcript-id>");
 }
 
 fn newest_wins(
@@ -443,24 +460,54 @@ fn sync_root(
             .push((id.as_str(), path.as_path(), fields));
         Ok(())
     })?;
-    let mut conflicts = find_conflicts(checked.into_inner().unwrap());
-    conflicts.retain(|id, _| !s.markers.contains_key(*id));
-    let skipped = conflicts.len();
-    for (id, (title, copies)) in &conflicts {
-        report_conflict(id, title.as_deref(), copies, paths);
+    let mut skipped = 0;
+    let mut resolved = 0;
+    let mut resolved_ids = Vec::new();
+    for (id, conflict) in find_conflicts(checked.into_inner().unwrap()) {
+        if s.markers.contains_key(id) {
+            continue;
+        }
+        let title = conflict.title.as_deref();
+        if !s.blocked.contains(id)
+            && let Some(transcript) = transcripts::continuation(
+                &paths.home,
+                conflict.copies.keys().map(String::as_str),
+                &conflict.saved_tips,
+            )
+        {
+            let verb = if dry { "would resolve" } else { "resolving" };
+            println!(
+                "{verb} \"{}\" (local_{id}) using continuation {transcript}",
+                title.unwrap_or("untitled")
+            );
+            resolved += sync_selected(
+                paths,
+                root,
+                members,
+                &s.chats[id],
+                &conflict.copies[transcript],
+                dry,
+            )?;
+            resolved_ids.push(id.to_owned());
+        } else {
+            skipped += 1;
+            report_conflict(id, title, &conflict.copies, paths, chat_dirs);
+            s.blocked.insert(id.to_owned());
+        }
     }
-    let conflicted: Vec<String> = conflicts.keys().map(|id| (*id).to_owned()).collect();
-    s.blocked.extend(conflicted);
+    for id in resolved_ids {
+        s.chats.remove(&id);
+    }
     let actions = plan(members, root, trash, &s)?;
     if dry {
         let mut lines: Vec<_> = actions.iter().map(|a| a.describe(paths)).collect();
         lines.sort_unstable();
         lines.iter().for_each(|line| println!("{line}"));
-        return Ok((actions.len(), skipped));
+        return Ok((resolved + actions.len(), skipped));
     }
     let (done, result) = apply(&actions);
     result.map_err(|e| format!("stopped after {done} of {} changes: {e}", actions.len()))?;
-    Ok((done, skipped))
+    Ok((resolved + done, skipped))
 }
 
 fn member_folders(root: &Path, cfg: &Config) -> Res<Vec<PathBuf>> {
@@ -471,6 +518,103 @@ fn member_folders(root: &Path, cfg: &Config) -> Res<Vec<PathBuf>> {
     }
     members.sort_unstable();
     Ok(members)
+}
+
+pub fn resolve(
+    paths: &Paths,
+    cfg: &Config,
+    cowork: bool,
+    chat: &str,
+    transcript: &str,
+    dry: bool,
+) -> Res {
+    let id = chat.strip_prefix("local_").unwrap_or(chat);
+    if !is_uuid(id) || !is_uuid(transcript) {
+        return Err("expected a chat UUID and a transcript UUID".into());
+    }
+    let root = if cowork {
+        paths.cowork_root()
+    } else {
+        paths.code_root()
+    };
+    let members = member_folders(&root, cfg)?;
+    let snapshot = scan(&members, cowork)?;
+    if snapshot.markers.contains_key(id) || snapshot.blocked.contains(id) {
+        return Err("chat has a deletion marker or unexpected entry".into());
+    }
+    let copies = snapshot.chats.get(id).ok_or("chat not found")?;
+    let mut selected = Vec::new();
+    for (path, _) in copies.values() {
+        if check_chat(path, id)?.transcript.as_deref() == Some(transcript) {
+            selected.push(path.as_path());
+        }
+    }
+    let changed = sync_selected(paths, &root, &members, copies, &selected, dry)?;
+    if changed == 0 {
+        println!("all copies already use {transcript}");
+    } else if !dry {
+        println!("synced {transcript} to {changed} folders");
+    }
+    Ok(())
+}
+
+fn sync_selected(
+    paths: &Paths,
+    root: &Path,
+    members: &[PathBuf],
+    copies: &HashMap<usize, Stamped>,
+    selected: &[&Path],
+    dry: bool,
+) -> Res<usize> {
+    let matching: HashSet<_> = copies
+        .iter()
+        .filter(|(_, (path, _))| selected.contains(&path.as_path()))
+        .map(|(&member, _)| member)
+        .collect();
+    let (source, modified) = (0..members.len())
+        .filter(|m| matching.contains(m))
+        .map(|m| &copies[&m])
+        .rev()
+        .max_by_key(|(_, modified)| *modified)
+        .ok_or("the selected transcript is not referenced by this chat")?;
+    let filename = source.file_name().ok_or("chat filename is missing")?;
+    let destinations: Vec<_> = members
+        .iter()
+        .enumerate()
+        .filter(|(m, _)| !matching.contains(m) || copies[m].1 < *modified)
+        .map(|(m, folder)| (m, folder.join(filename)))
+        .collect();
+    if destinations.is_empty() {
+        return Ok(0);
+    }
+    if dry {
+        for (_, dst) in &destinations {
+            println!("would sync {} -> {}", paths.brief(source), paths.brief(dst));
+        }
+        return Ok(destinations.len());
+    }
+
+    fs::create_dir_all(paths.backups())?;
+    let root_name = root.file_name().ok_or("chat root name is missing")?;
+    let backup = paths.backups().join(format!(
+        "resolve-{}-{}-{}-{}",
+        stamp(),
+        std::process::id(),
+        root_name.to_string_lossy(),
+        filename.to_string_lossy()
+    ));
+    fs::create_dir(&backup)?;
+    let backup_root = backup.join(root_name);
+    for (m, _) in &destinations {
+        if let Some((path, _)) = copies.get(m) {
+            copy_chat_file(path, &backup_root.join(path.strip_prefix(root)?))?;
+        }
+    }
+    println!("backed up replaced records to {}", paths.brief(&backup));
+    for (_, dst) in &destinations {
+        replace_chat_file(source, dst)?;
+    }
+    Ok(destinations.len())
 }
 
 /// Syncs both chat roots, backing them up first whenever an account hasn't been covered yet.
@@ -651,6 +795,92 @@ pub mod tests {
         serde_json::from_slice::<serde_json::Value>(&raw).unwrap()["cliSessionId"].clone()
     }
 
+    fn transcript_log(paths: &Paths, id: &str, records: &[serde_json::Value]) {
+        let dir = paths.home.join(".claude/projects/example");
+        fs::create_dir_all(&dir).unwrap();
+        let lines: Vec<_> = records.iter().map(ToString::to_string).collect();
+        fs::write(dir.join(format!("{id}.jsonl")), lines.join("\n")).unwrap();
+    }
+
+    #[test]
+    fn sync_chooses_the_proven_continuation_and_backs_up_the_stale_record() {
+        use serde_json::json;
+
+        let paths = sandbox("auto-resolve");
+        let (a, b) = (folder(&paths, A), folder(&paths, B));
+        chat_on(&a, CHAT, Some(A), 10);
+        chat_on(&b, CHAT, Some(B), 100);
+        transcript_log(
+            &paths,
+            A,
+            &[json!({
+                "type": "assistant", "uuid": "old-tip", "sessionId": A
+            })],
+        );
+        transcript_log(
+            &paths,
+            B,
+            &[
+                json!({"type": "system", "subtype": "compact_boundary", "uuid": "compact",
+                   "parentUuid": null, "logicalParentUuid": "old-tip", "sessionId": B}),
+                json!({"type": "assistant", "uuid": "new-tip", "parentUuid": "compact", "sessionId": B}),
+            ],
+        );
+
+        assert!(sync(&paths, &mut config(), true).unwrap());
+        assert_eq!(transcript_of(&a, CHAT), A);
+        assert!(!paths.backups().exists());
+        assert!(sync(&paths, &mut config(), false).unwrap());
+        assert_eq!(transcript_of(&a, CHAT), B);
+        let backup = fs::read_dir(paths.backups())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        let backed_up = backup.path().join("claude-code-sessions").join(A).join(ORG);
+        assert_eq!(transcript_of(&backed_up, CHAT), A);
+        assert!(sync(&paths, &mut config(), false).unwrap());
+        assert_eq!(fs::read_dir(paths.backups()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn sync_leaves_diverging_or_incomplete_histories_for_manual_resolution() {
+        use serde_json::json;
+
+        let paths = sandbox("ambiguous");
+        let (a, b) = (folder(&paths, A), folder(&paths, B));
+        chat_on(&a, CHAT, Some(A), 100);
+        chat_on(&b, CHAT, Some(B), 10);
+        let shared = json!({"type": "assistant", "uuid": "shared", "sessionId": A});
+        transcript_log(
+            &paths,
+            A,
+            &[
+                shared.clone(),
+                json!({"type": "assistant", "uuid": "old-tip", "parentUuid": "shared", "sessionId": A}),
+            ],
+        );
+        transcript_log(
+            &paths,
+            B,
+            &[json!({
+                "type": "assistant", "uuid": "new-tip", "parentUuid": "shared", "sessionId": B
+            })],
+        );
+        assert!(!sync(&paths, &mut config(), false).unwrap());
+        assert_eq!(transcript_of(&a, CHAT), A);
+        assert_eq!(transcript_of(&b, CHAT), B);
+
+        // The cached log has lost a turn that the desktop record still points to.
+        fs::write(a.join(format!("local_{CHAT}.json")), json!({
+            "sessionId": format!("local_{CHAT}"), "cliSessionId": A, "lastAssistantUuid": "old-tip"
+        }).to_string()).unwrap();
+        transcript_log(&paths, A, &[shared]);
+        assert!(!sync(&paths, &mut config(), false).unwrap());
+        assert_eq!(transcript_of(&a, CHAT), A);
+        assert!(!paths.backups().exists());
+    }
+
     #[test]
     fn copies_opening_different_transcripts_are_left_alone() {
         let paths = sandbox("conflict");
@@ -668,17 +898,29 @@ pub mod tests {
     }
 
     #[test]
-    fn deleting_the_wrong_copy_resolves_a_conflict() {
+    fn resolving_a_conflict_backs_up_and_replaces_even_a_newer_copy() {
         let paths = sandbox("resolve");
         let (a, b) = (folder(&paths, A), folder(&paths, B));
-        chat_on(&a, CHAT, Some("right"), 100);
-        chat_on(&b, CHAT, Some("stale"), 10);
-        assert!(!sync(&paths, &mut config(), false).unwrap());
+        let cfg = config();
+        chat_on(&a, CHAT, Some(A), 100);
+        chat_on(&b, CHAT, Some(B), 10);
+        assert!(resolve(&paths, &cfg, false, CHAT, ORG, false).is_err());
+        resolve(&paths, &cfg, false, CHAT, A, true).unwrap();
+        assert_eq!(transcript_of(&b, CHAT), B);
+        assert!(!paths.backups().exists());
 
-        fs::remove_file(b.join(format!("local_{CHAT}.json"))).unwrap();
-
+        resolve(&paths, &cfg, false, CHAT, A, false).unwrap();
+        assert_eq!(transcript_of(&b, CHAT), A);
+        let backup = fs::read_dir(paths.backups())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        let backed_up = backup.path().join("claude-code-sessions").join(B).join(ORG);
+        assert_eq!(transcript_of(&backed_up, CHAT), B);
+        resolve(&paths, &cfg, false, CHAT, A, false).unwrap();
+        assert_eq!(fs::read_dir(paths.backups()).unwrap().count(), 1);
         assert!(sync(&paths, &mut config(), false).unwrap());
-        assert_eq!(transcript_of(&b, CHAT), "right");
     }
 
     #[test]

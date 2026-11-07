@@ -28,7 +28,14 @@ quit Claude → ccsync → reopen Claude → switch accounts
 
 Missing and older chats are copied to every org folder of every added account; the newest copy wins. A delete carries over, moving the chat to `~/.ccsync/trash/`. Only `local_<id>.json`, Cowork `local_<id>/` folders and `deleted_<id>` markers are touched.
 
-Copies that open different transcripts (`cliSessionId`) are skipped and reported, because the newest one may be a stale copy Claude has just saved. Delete the copies of the wrong transcript and sync again.
+When copies open different transcripts (`cliSessionId`), sync checks the local Claude transcripts. It automatically selects a transcript only if its last main conversation message descends from every other transcript's last message and includes the saved chat tips in its history. Sync backs up replaced records before applying the change. If histories diverged or the logs can't establish ancestry, choose the transcript you want the chat to open using the command printed in the conflict report.
+
+```sh
+ccsync --dry-run resolve code <chat-id> <transcript-id>
+ccsync resolve code <chat-id> <transcript-id>
+```
+
+Use `cowork` in place of `code` for a Cowork conflict. Quit Claude before applying the resolution. The command updates that chat's metadata across accounts and saves replaced records under `~/.ccsync/backups/resolve-*`, with their original folder layout. Both transcript files are preserved.
 
 An account's first sync backs up both chat folders to `~/.ccsync/backups/`. If any chat file looks unfamiliar, that folder is skipped rather than guessed at. Files are cloned on APFS, so backups are nearly free.
 

@@ -2,6 +2,7 @@ mod accounts;
 mod chats;
 mod fsutil;
 mod sections;
+mod transcripts;
 
 use std::{
     env,
@@ -23,6 +24,8 @@ Sync Claude desktop chats and sidebar sections across accounts.
   ccsync list              show accounts on this Mac
   ccsync add <email> [id]  add an account
   ccsync remove <account>  stop syncing an account
+  ccsync resolve <code|cowork> <chat-id> <transcript-id>
+                           back up and sync one chat using the selected transcript
 
   -n, --dry-run            show what would change, change nothing
 
@@ -139,10 +142,20 @@ fn run() -> Res {
             let (flags, rest): (Vec<&str>, Vec<&str>) =
                 args.iter().partition(|a| a.starts_with('-'));
             let dry = !flags.is_empty();
-            if rest.len() > 1 || flags.iter().any(|f| !matches!(*f, "-n" | "--dry-run")) {
+            if flags.iter().any(|f| !matches!(*f, "-n" | "--dry-run")) {
                 return Err(USAGE.into());
             }
-            sync(&paths, rest.first().copied(), dry)?;
+            match rest.as_slice() {
+                ["resolve", root @ ("code" | "cowork"), chat, transcript] => {
+                    let _lock = if dry { None } else { Some(lock(&paths)?) };
+                    require_quit(dry, || claude_running(&paths))?;
+                    let cfg = Config::load(&paths)?;
+                    chats::resolve(&paths, &cfg, *root == "cowork", chat, transcript, dry)?;
+                }
+                [] => sync(&paths, None, dry)?,
+                [source] => sync(&paths, Some(source), dry)?,
+                _ => return Err(USAGE.into()),
+            }
         }
     }
     Ok(())

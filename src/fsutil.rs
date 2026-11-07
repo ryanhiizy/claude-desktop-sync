@@ -50,6 +50,15 @@ pub fn par<T: Sync>(items: &[T], f: impl Fn(&T) -> Res + Sync) -> Res {
 /// Replaces `dst` through a rename so the app never reads half a chat. `dst` takes `src`'s mtime,
 /// which stops a file bouncing between accounts. A write the app made since planning wins.
 pub fn copy_chat_file(src: &Path, dst: &Path) -> Res {
+    copy_chat(src, dst, false)
+}
+
+/// The user chose the source explicitly and the destination has been backed up.
+pub fn replace_chat_file(src: &Path, dst: &Path) -> Res {
+    copy_chat(src, dst, true)
+}
+
+fn copy_chat(src: &Path, dst: &Path, replace: bool) -> Res {
     let meta = fs::metadata(src)?;
     let mtime = meta.modified()?;
     if let Some(parent) = dst.parent() {
@@ -69,7 +78,7 @@ pub fn copy_chat_file(src: &Path, dst: &Path) -> Res {
             fs::set_permissions(&tmp, fs::Permissions::from_mode(mode))?;
         }
         match fs::symlink_metadata(dst).and_then(|m| m.modified()) {
-            Ok(current) if current > mtime => Ok(()),
+            Ok(current) if !replace && current > mtime => Ok(()),
             _ => Ok(fs::rename(&tmp, dst)?),
         }
     })();
