@@ -161,13 +161,28 @@ struct ChatFields {
     transcript: Option<String>,
     title: Option<String>,
     last_assistant: Option<String>,
-    remote_history: RemoteHistory,
+    history: SessionHistory,
 }
 
 #[derive(Default)]
-struct RemoteHistory {
-    prior: Vec<String>,
+struct SessionHistory {
+    prior: HashSet<String>,
+    prior_left_at: HashMap<String, u64>,
     last_activity: Option<u64>,
+}
+
+impl SessionHistory {
+    fn supersedes(&self, prior_id: &str, prior: &Self) -> bool {
+        let (Some(before), Some(after)) = (prior.last_activity, self.last_activity) else {
+            return false;
+        };
+        self.prior.contains(prior_id)
+            && before < after
+            && self
+                .prior_left_at
+                .get(prior_id)
+                .is_none_or(|left| before <= *left)
+    }
 }
 
 struct ChatVisitor;
@@ -190,21 +205,31 @@ impl<'de> Visitor<'de> for ChatVisitor {
                         .as_str()
                         .map(str::to_owned);
                 }
-                "priorRemoteCliSessionIds" => {
+                "priorCliSessionIds" | "priorRemoteCliSessionIds" => {
                     if let serde_json::Value::Array(ids) = map.next_value()? {
                         let prior: Option<Vec<_>> = ids
                             .iter()
                             .map(|id| id.as_str().filter(|id| is_uuid(id)))
                             .collect();
                         if let Some(prior) = prior {
-                            found.remote_history.prior =
-                                prior.into_iter().map(str::to_owned).collect();
+                            found
+                                .history
+                                .prior
+                                .extend(prior.into_iter().map(str::to_owned));
                         }
                     }
                 }
+                "priorCliSessionLeftAt" => {
+                    if let serde_json::Value::Object(times) = map.next_value()? {
+                        found.history.prior_left_at.extend(
+                            times
+                                .into_iter()
+                                .filter_map(|(id, time)| Some((id, time.as_u64()?))),
+                        );
+                    }
+                }
                 "lastActivityAt" => {
-                    found.remote_history.last_activity =
-                        map.next_value::<serde_json::Value>()?.as_u64();
+                    found.history.last_activity = map.next_value::<serde_json::Value>()?.as_u64();
                 }
                 _ => {
                     map.next_value::<IgnoredAny>()?;
@@ -241,23 +266,21 @@ struct Conflict<'a> {
 #[derive(Default)]
 struct TranscriptCopies<'a> {
     paths: Vec<&'a Path>,
-    remote_histories: Vec<RemoteHistory>,
+    histories: Vec<SessionHistory>,
 }
 
 impl Conflict<'_> {
     fn recorded_continuation(&self) -> Option<&str> {
         self.copies.iter().find_map(|(id, copies)| {
             let competing = self.copies.iter().filter(|(other, _)| *other != id);
-            let proven = copies.remote_histories.iter().all(|candidate| {
+            let proven = copies.histories.iter().all(|candidate| {
                 if candidate.prior.contains(id) {
                     return false;
                 }
                 competing.clone().all(|(other, copies)| {
-                    candidate.prior.contains(other)
-                        && copies.remote_histories.iter().all(|prior| {
-                            matches!((prior.last_activity, candidate.last_activity), (Some(before), Some(after)) if before < after)
-                                && !prior.prior.contains(id)
-                        })
+                    copies.histories.iter().all(|prior| {
+                        candidate.supersedes(other, prior) && !prior.prior.contains(id)
+                    })
                 })
             });
             proven.then_some(id.as_str())
@@ -279,7 +302,7 @@ fn find_conflicts<'a>(
         if let Some(transcript) = fields.transcript {
             let copies = conflict.copies.entry(transcript).or_default();
             copies.paths.push(path);
-            copies.remote_histories.push(fields.remote_history);
+            copies.histories.push(fields.history);
         }
         conflict.saved_tips.extend(fields.last_assistant);
     }
@@ -883,6 +906,47 @@ pub mod tests {
         assert!(!paths.backups().exists());
 
         write(&a, A, 10, &[]);
+        assert!(sync(&paths, &mut config(), false).unwrap());
+        assert_eq!(transcript_of(&a, CHAT), B);
+    }
+
+    #[test]
+    fn sync_resolves_local_rewinds_unless_the_prior_branch_was_used_again() {
+        use serde_json::json;
+
+        let paths = sandbox("local-rewind");
+        let (a, b) = (folder(&paths, A), folder(&paths, B));
+        let filename = format!("local_{CHAT}.json");
+        fs::write(
+            b.join(&filename),
+            json!({
+                "sessionId": filename.trim_end_matches(".json"),
+                "cliSessionId": B,
+                "lastActivityAt": 30,
+                "priorCliSessionIds": [A],
+                "priorCliSessionLeftAt": { A: 20 }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let write_prior = |activity| {
+            fs::write(
+                a.join(&filename),
+                json!({
+                    "sessionId": filename.trim_end_matches(".json"),
+                    "cliSessionId": A,
+                    "lastActivityAt": activity
+                })
+                .to_string(),
+            )
+            .unwrap();
+        };
+
+        write_prior(21);
+        assert!(!sync(&paths, &mut config(), false).unwrap());
+        assert_eq!(transcript_of(&a, CHAT), A);
+
+        write_prior(20);
         assert!(sync(&paths, &mut config(), false).unwrap());
         assert_eq!(transcript_of(&a, CHAT), B);
     }
